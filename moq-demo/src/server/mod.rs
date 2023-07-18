@@ -7,20 +7,16 @@ use h3_webtransport::server::AcceptedBi;
 use moq_transport::AcceptSetup;
 use moq_warp::relay::ServerConfig;
 use tokio::task::JoinSet;
-use warp::{Future, http};
-
-use self::stream::{QuinnSendStream, QuinnRecvStream};
-
-mod stream;
+use warp::{http, Future};
 
 pub struct Server {
 	// The MoQ transport server.
-	server: h3_webtransport::server::WebTransportSession<h3_quinn::Connection, bytes::Bytes>,
+	server: quinn::Endpoint,
 }
 
 impl Server {
 	// Create a new server
-	pub fn new_quinn_connection(config: ServerConfig) -> anyhow::Result<h3_quinn::Endpoint> {
+	pub fn new(config: ServerConfig) -> anyhow::Result<Self> {
 		// Read the PEM certificate chain
 		let certs = fs::File::open(config.cert).context("failed to open cert file")?;
 		let mut certs = io::BufReader::new(certs);
@@ -46,13 +42,7 @@ impl Server {
 			.with_single_cert(certs, key)?;
 
 		tls_config.max_early_data_size = u32::MAX;
-		let alpn: Vec<Vec<u8>> = vec![
-			b"h3".to_vec(),
-			b"h3-32".to_vec(),
-			b"h3-31".to_vec(),
-			b"h3-30".to_vec(),
-			b"h3-29".to_vec(),
-		];
+		let alpn: Vec<Vec<u8>> = vec![webtransport_quinn::ALPN];
 		tls_config.alpn_protocols = alpn;
 
 		let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(tls_config));
@@ -66,7 +56,7 @@ impl Server {
 		server_config.transport = std::sync::Arc::new(transport_config);
 		let server = quinn::Endpoint::server(server_config, config.addr)?;
 
-		Ok(server)
+		Ok(Self { server })
 	}
 
 	pub async fn accept_new_webtransport_session(endpoint: &h3_quinn::Endpoint) -> anyhow::Result<Connect> {
@@ -78,7 +68,7 @@ impl Server {
 				conn = endpoint.accept() => {
 					let conn = conn.context("failed to accept connection").unwrap();
 					handshake.spawn(async move {
-						
+
 						let conn = conn.await.context("failed to accept h3 connection")?;
 
 						let mut conn = h3::server::builder()
@@ -119,7 +109,6 @@ impl Server {
 			)
 		}
 	}
-
 }
 
 // The WebTransport CONNECT has arrived, and we need to decide if we accept it.
@@ -132,18 +121,17 @@ pub struct Connect {
 }
 
 impl Connect {
-
 	// Accept the WebTransport session.
 	pub async fn accept(self) -> anyhow::Result<AcceptSetup<Server>> {
 		let session = h3_webtransport::server::WebTransportSession::accept(self.req, self.stream, self.conn).await?;
-		let mut session = Server{server: session};
+		let mut session = Server { server: session };
 
 		let (control_stream_send, control_stream_recv) = moq_transport::accept_bidi(&mut session)
 			.await
 			.context("failed to accept bidi stream")?
 			.unwrap();
 
-		Ok(moq_transport::Session::accept(Box::new(control_stream_send), Box::new(control_stream_recv), Box::new(session)).await?)
+		Ok(moq_transport::Session::accept(session).await?)
 	}
 
 	// Reject the WebTransport session with a HTTP response.
@@ -153,34 +141,34 @@ impl Connect {
 	}
 }
 
-
 impl webtransport_generic::Connection for Server {
-
 	type Error = anyhow::Error;
-    type SendStream = QuinnSendStream;
+	type SendStream = QuinnSendStream;
 
-    type RecvStream = QuinnRecvStream;
+	type RecvStream = QuinnRecvStream;
 
-    fn poll_accept_uni(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<Self::RecvStream>, Self::Error>> {
+	fn poll_accept_uni(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Result<Option<Self::RecvStream>, Self::Error>> {
 		let fut = self.server.accept_uni();
 		let fut = std::pin::pin!(fut);
 		fut.poll(cx)
-		.map_ok(|opt| opt.map(|(_, s)| QuinnRecvStream::new(s)))
-		.map_err(|e| anyhow::anyhow!("{:?}", e))
-    }
+			.map_ok(|opt| opt.map(|(_, s)| QuinnRecvStream::new(s)))
+			.map_err(|e| anyhow::anyhow!("{:?}", e))
+	}
 
-    fn poll_accept_bidi(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<(Self::SendStream, Self::RecvStream)>, Self::Error>> {
+	fn poll_accept_bidi(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Result<Option<(Self::SendStream, Self::RecvStream)>, Self::Error>> {
 		let fut = self.server.accept_bi();
 		let fut = std::pin::pin!(fut);
 		let res = std::task::ready!(fut.poll(cx).map_err(|e| anyhow::anyhow!("{:?}", e)));
 		match res {
-			Ok(Some(AcceptedBi::Request(_, _))) => std::task::Poll::Ready(Err(anyhow::anyhow!("received new session whils accepting bidi stream"))),
+			Ok(Some(AcceptedBi::Request(_, _))) => {
+				std::task::Poll::Ready(Err(anyhow::anyhow!("received new session whils accepting bidi stream")))
+			}
 			Ok(Some(AcceptedBi::BidiStream(_, s))) => {
 				let (send, recv) = s.split();
 				std::task::Poll::Ready(Ok(Some((QuinnSendStream::new(send), QuinnRecvStream::new(recv)))))
@@ -188,35 +176,34 @@ impl webtransport_generic::Connection for Server {
 			Ok(None) => std::task::Poll::Ready(Ok(None)),
 			Err(e) => std::task::Poll::Ready(Err(e)),
 		}
-    }
+	}
 
-    fn poll_open_bidi(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+	fn poll_open_bidi(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
 		let fut = self.server.open_bi(self.server.session_id());
 		let fut = std::pin::pin!(fut);
 		fut.poll(cx)
-		.map_ok(|s| {
+			.map_ok(|s| {
 				let (send, recv) = s.split();
 				(QuinnSendStream::new(send), QuinnRecvStream::new(recv))
-			}
-		)
-		.map_err(|e| anyhow::anyhow!("{:?}", e))
-    }
+			})
+			.map_err(|e| anyhow::anyhow!("{:?}", e))
+	}
 
-    fn poll_open_uni(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::SendStream, Self::Error>> {
+	fn poll_open_uni(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Result<Self::SendStream, Self::Error>> {
 		let fut = self.server.open_uni(self.server.session_id());
 		let fut = std::pin::pin!(fut);
 		fut.poll(cx)
-		.map_ok(|s| QuinnSendStream::new(s))
-		.map_err(|e| anyhow::anyhow!("{:?}", e))
-    }
+			.map_ok(|s| QuinnSendStream::new(s))
+			.map_err(|e| anyhow::anyhow!("{:?}", e))
+	}
 
-    fn close(&mut self, _code: u32, _reason: &[u8]) {
-        todo!("not implemented")
-    }
+	fn close(&mut self, _code: u32, _reason: &[u8]) {
+		todo!("not implemented")
+	}
 }

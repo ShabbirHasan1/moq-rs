@@ -7,7 +7,10 @@ use ring::digest::{digest, SHA256};
 use tokio::task::JoinSet;
 use warp::Filter;
 
-use moq_warp::{relay::{self, broker::Broadcasts}, source};
+use moq_warp::{
+	relay::{self, broker::Broadcasts},
+	source,
+};
 
 mod server;
 
@@ -29,9 +32,7 @@ struct Cli {
 	/// Use the media file at this path
 	#[arg(short, long, default_value = "media/fragmented.mp4")]
 	media: path::PathBuf,
-
 }
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 	broker
 		.announce("quic.video/demo", media.source())
 		.context("failed to announce file source")?;
-	
+
 	// Create a server to actually serve the media
 	let config = relay::ServerConfig {
 		addr: args.addr,
@@ -63,12 +64,11 @@ async fn main() -> anyhow::Result<()> {
 		res = media.run() => res.context("failed to run media source"),
 		res = serve => res.context("failed to run HTTP server"),
 	}
-
 }
 
 async fn run_server(config: relay::ServerConfig, broker: Broadcasts) -> anyhow::Result<()> {
+	let quinn = server::Server::new(config).unwrap();
 
-	let quinn = server::Server::new_quinn_connection(config).unwrap();
 	let mut tasks = JoinSet::new();
 	loop {
 		let broker = broker.clone();
@@ -86,7 +86,7 @@ async fn run_server(config: relay::ServerConfig, broker: Broadcasts) -> anyhow::
 						version: Version::DRAFT_00,
 						role,
 					};
-				
+
 					let session = client_setup.accept(setup_server).await?;
 					let session = relay::Session::from_transport_session(session, broker.clone()).await?;
 					session.run().await?;
